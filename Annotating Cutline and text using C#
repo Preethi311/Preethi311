@@ -1,0 +1,199 @@
+using Autodesk.AutoCAD.ApplicationServices;
+using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.EditorInput;
+using Autodesk.AutoCAD.Geometry;
+using Autodesk.AutoCAD.Runtime;
+using System;
+using System.Collections.Generic;
+
+namespace CutlineAutomation
+{
+    public class AutoCutlinePlugin : IExtensionApplication
+    {
+        public void Initialize()
+        {
+            Application.DocumentManager.MdiActiveDocument.Editor.WriteMessage("\nAuto Cutline Plugin Loaded.");
+        }
+
+        public void Terminate() { }
+
+        [CommandMethod("GenerateCutlines")]
+        public void GenerateCutlines()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            try
+            {
+                using (Transaction trans = db.TransactionManager.StartTransaction())
+                {
+                    // Get the layout dictionary
+                    DBDictionary layoutDict = (DBDictionary)trans.GetObject(db.LayoutDictionaryId, OpenMode.ForRead);
+
+                    // Store layout names in order
+                    List<string> layoutNames = new List<string>();
+                    Dictionary<string, Layout> layoutObjects = new Dictionary<string, Layout>();
+
+                    foreach (DBDictionaryEntry layoutEntry in layoutDict)
+                    {
+                        Layout layout = (Layout)trans.GetObject(layoutEntry.Value, OpenMode.ForRead);
+                        if (!layout.ModelType) // Skip model space
+                        {
+                            layoutNames.Add(layout.LayoutName);
+                            layoutObjects[layout.LayoutName] = layout;
+                        }
+                    }
+
+                    int layoutCount = layoutNames.Count;
+                    if (layoutCount < 2)
+                    {
+                        ed.WriteMessage("\nAt least two layouts are required for cutlines.");
+                        return;
+                    }
+
+                    for (int i = 0; i < layoutCount; i++)
+                    {
+                        string currentLayoutName = layoutNames[i];
+                        Layout currentLayout = layoutObjects[currentLayoutName];
+
+                        BlockTableRecord layoutBlock = (BlockTableRecord)trans.GetObject(currentLayout.BlockTableRecordId, OpenMode.ForRead);
+
+                        // Calculate the extents of all entities within the layout
+                        Extents3d? layoutExtents = null;
+                        foreach (ObjectId objectId in layoutBlock)
+                        {
+                            Entity entity = trans.GetObject(objectId, OpenMode.ForRead) as Entity;
+                            if (entity != null && entity.Bounds.HasValue)
+                            {
+                                Extents3d entityExtents = entity.Bounds.Value;
+                                layoutExtents = layoutExtents.HasValue
+                                    ? new Extents3d(
+                                        new Point3d(
+                                            Math.Min(layoutExtents.Value.MinPoint.X, entityExtents.MinPoint.X),
+                                            Math.Min(layoutExtents.Value.MinPoint.Y, entityExtents.MinPoint.Y),
+                                            Math.Min(layoutExtents.Value.MinPoint.Z, entityExtents.MinPoint.Z)),
+                                        new Point3d(
+                                            Math.Max(layoutExtents.Value.MaxPoint.X, entityExtents.MaxPoint.X),
+                                            Math.Max(layoutExtents.Value.MaxPoint.Y, entityExtents.MaxPoint.Y),
+                                            Math.Max(layoutExtents.Value.MaxPoint.Z, entityExtents.MaxPoint.Z)))
+                                    : entityExtents;
+                            }
+                        }
+
+                        if (!layoutExtents.HasValue)
+                        {
+                            ed.WriteMessage($"\nNo entities found in layout: {currentLayoutName}");
+                            continue;
+                        }
+
+                        Point3d minPoint = layoutExtents.Value.MinPoint;
+                        Point3d maxPoint = layoutExtents.Value.MaxPoint;
+
+                        // Bring cutlines closer to viewport edges
+                        double offset = 280; // Adjusted from 20 to 10
+
+                        string annotationText = "";
+
+                        if (i == 0)
+                        {
+                            annotationText = $"For Continuation refer - {layoutNames[i + 1]}"; // First layout refers to next
+                            CreateCutline(doc, trans, minPoint, maxPoint, annotationText, layoutBlock, "end", offset, true); // Pass true for the first cutline
+                        }
+                        else if (i == layoutCount - 1)
+                        {
+                            annotationText = $"For Continuation refer - {layoutNames[i - 1]}"; // Last layout refers to previous
+                            CreateCutline(doc, trans, minPoint, maxPoint, annotationText, layoutBlock, "start", offset, false); // Pass false for other cutlines
+                        }
+                        else
+                        {
+                            CreateCutline(doc, trans, minPoint, maxPoint, $"For Continuation refer - {layoutNames[i - 1]}", layoutBlock, "start", offset, false);
+                            CreateCutline(doc, trans, minPoint, maxPoint, $"For Continuation refer - {layoutNames[i + 1]}", layoutBlock, "end", offset, false);
+                        }
+                    }
+
+                    trans.Commit();
+                    ed.WriteMessage("\nCutlines generated successfully for all layouts.");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage("\nError: " + ex.Message);
+            }
+        }
+
+        private void CreateCutline(Document doc, Transaction trans, Point3d minPoint, Point3d maxPoint, string annotationText, BlockTableRecord layoutBlock, string cutlinePosition, double offset, bool isFirstCutline)
+        {
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            BlockTableRecord layoutSpace = (BlockTableRecord)trans.GetObject(layoutBlock.ObjectId, OpenMode.ForWrite);
+
+            double cutlineLength = 280;
+
+            Point3d centerPoint = new Point3d((minPoint.X + maxPoint.X) / 2, (minPoint.Y + maxPoint.Y) / 2, 0);
+
+            if (cutlinePosition == "start" || cutlinePosition == "both")
+            {
+                // Move the cutline up (increase Y offset)
+                Point3d startPoint = new Point3d(minPoint.X + offset, centerPoint.Y - (cutlineLength / 2) + 15, 0); // 10 units upwards
+                Point3d endPoint = new Point3d(minPoint.X + offset, centerPoint.Y + (cutlineLength / 2) + 15, 0); // 10 units upwards
+                CreateCutlineEntity(doc, trans, layoutSpace, startPoint, endPoint, annotationText, isFirstCutline); // Pass isFirstCutline flag
+            }
+
+            if (cutlinePosition == "end" || cutlinePosition == "both")
+            {
+                double adjustedOffset = maxPoint.X - offset;
+
+                if (adjustedOffset - 250 > minPoint.X + 250)
+                {
+                    adjustedOffset = adjustedOffset - 250;
+                }
+                else
+                {
+                    adjustedOffset = minPoint.X + 250;
+                }
+
+                // Move the cutline up (increase Y offset)
+                Point3d startPoint = new Point3d(adjustedOffset, centerPoint.Y - (cutlineLength / 2) + 10, 0); // 10 units upwards
+                Point3d endPoint = new Point3d(adjustedOffset, centerPoint.Y + (cutlineLength / 2) + 10, 0); // 10 units upwards
+                CreateCutlineEntity(doc, trans, layoutSpace, startPoint, endPoint, annotationText, false); // Text is not the first cutline, so pass false
+            }
+
+            ed.WriteMessage($"\nCutline created with annotation: {annotationText}");
+        }
+
+        private void CreateCutlineEntity(Document doc, Transaction trans, BlockTableRecord layoutSpace, Point3d startPoint, Point3d endPoint, string annotationText, bool isFirstCutline)
+        {
+            Line cutline = new Line(startPoint, endPoint)
+            {
+                ColorIndex = 1 // Red
+            };
+            layoutSpace.AppendEntity(cutline);
+            trans.AddNewlyCreatedDBObject(cutline, true);
+
+            Point3d midPoint = new Point3d(
+                (startPoint.X + endPoint.X) / 2,
+                (startPoint.Y + endPoint.Y) / 2,
+                0
+            );
+
+            // Adjust text position
+            double textOffset = isFirstCutline ? -25 : 5; // Move text backwards for the first cutline
+            DBText annotation = new DBText
+            {
+                Position = midPoint + new Vector3d(textOffset, 5, 0), // Adjust the X position to move text horizontally
+                Height = 2.5,
+                TextString = annotationText,
+                HorizontalMode = TextHorizontalMode.TextCenter,
+                VerticalMode = TextVerticalMode.TextBase,
+                AlignmentPoint = midPoint + new Vector3d(textOffset, 5, 0), // Adjust the X position of alignment point
+                Rotation = Math.PI / 2 // Vertical text
+            };
+
+            annotation.SetDatabaseDefaults();
+            layoutSpace.AppendEntity(annotation);
+            trans.AddNewlyCreatedDBObject(annotation, true);
+        }
+    }
+}
